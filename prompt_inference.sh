@@ -3,8 +3,10 @@ temp=0.8
 token_temp=0.8
 ode_steps=32
 topp=0.95
-prompts="prompts/valid_libri_1_sample.csv"
-root_dir=/share/data/speech/Datasets/LibriSpeech/LibriSpeech # the path to librispeech
+# prompts="prompts/valid_libri_1_sample.csv"
+prompts="prompts/test_libri_1_sample.csv"
+# root_dir=/share/data/speech/Datasets/LibriSpeech/LibriSpeech # the path to librispeech
+root_dir=/local/andybi7676/projects/flow-slm/work/corpus/LibriSpeech # the path to librispeech
 n_quantizers=16
 penalize_weight=10
 vocoder_type="mimi"
@@ -13,7 +15,8 @@ samples_per_prompt=4
 batch_size=4
 solver="euler"
 
-ckpt_path="/share/data/speech/jjery2243542/continuous_gslm/ckpt/MLSEn+people/FM/5e-4/85k/reduction_1/token_loss_weight_1.0/n_res_blocks_6/ll_elm_8bit_fm_mimi_token_conditioning_future_4_cond_future_1b_extended/model-step=0095000.ckpt/modified_ckpt/1b_extend.bin"
+# ckpt_path="/share/data/speech/jjery2243542/continuous_gslm/ckpt/MLSEn+people/FM/5e-4/85k/reduction_1/token_loss_weight_1.0/n_res_blocks_6/ll_elm_8bit_fm_mimi_token_conditioning_future_4_cond_future_1b_extended/model-step=0095000.ckpt/modified_ckpt/1b_extend.bin"
+ckpt_path="/local/andybi7676/projects/flow-slm/work/pretrained_models/flow_slm/1b_extend.bin"
 conf_path="conf/1b_extended.yaml"
 output_dir="./test_output/"
 

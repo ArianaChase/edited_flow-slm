@@ -42,7 +42,11 @@ class SpeechDataModule(pl.LightningDataModule):
             self.val_set = HFListDataset(kind="mls", size=size, split="dev", vad=vad)
 
         if stage in ("predict", "test"):
-            self.test_set = SpeechDataset(self.args.predict_id_file, self.args.data_dir,
+            if self.args.is_speechocean:
+                print("setting up speechocean dataset for evaluation...")
+                self.test_set = SpeechOceanDataset(dataset_path=self.args.data_dir, split=self.args.split, sr=self.conf.data.sr)
+            else:
+                self.test_set = SpeechDataset(self.args.predict_id_file, self.args.data_dir,
                                           default_sr=self.conf.data.sr, ext=self.conf.data.ext)
 
     def train_dataloader(self):
@@ -165,6 +169,37 @@ class SpeechDataset(Dataset):
             wav = wav[0]
         if sr != self.default_sr:
             wav = F.resample(wav, sr, self.default_sr)
+        return uid, wav
+
+
+class SpeechOceanDataset(Dataset):
+    def __init__(self, dataset_path: str = "andybi7676/speechocean_with_mfa",
+                 split: str = "train", sr: int = 24000):
+        self.dataset = load_dataset(dataset_path, split=split)
+        self.split = split
+        self.sr = sr
+        self.uid_column = next(
+            (name for name in ("uid", "id", "utt_id", "audio_id") if name in self.dataset.column_names),
+            None,
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Tuple[str, torch.Tensor]:
+        row = self.dataset[index]
+        audio = row["audio"]
+        wav = torch.as_tensor(audio["array"], dtype=torch.float32)
+        if wav.dim() == 2:
+            wav = wav[0]
+
+        audio_sr = audio["sampling_rate"]
+        if audio_sr != self.sr:
+            wav = F.resample(wav, audio_sr, self.sr)
+
+        path = audio._hf_encoded.get('path').split('.')[0]
+
+        uid = str(row[self.uid_column]) if self.uid_column is not None else f"{self.split}_{index}_{path}"
         return uid, wav
 
 

@@ -295,6 +295,8 @@ def main():
     parser.add_argument("--hf_training_data", action="store_true")
     parser.add_argument("--validation_only", action="store_true")
     parser.add_argument("--predict_only", action="store_true")
+    parser.add_argument("--is_speechocean", action="store_true", help="whether the dataset is speechocean, which requires special handling in data loading")
+    parser.add_argument("--split", type=str, default="test", help="which split to evaluate on if --is_speechocean is set")
     parser.add_argument("--training_data", choices=["MLSEn10k", "MLSEn", "MLSEn+people"], default=None)
     parser.add_argument("--valid_id_file", help="Path to validation dataset ids")
     parser.add_argument("--predict_id_file", help="Path to prediction dataset ids")
