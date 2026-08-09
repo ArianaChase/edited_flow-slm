@@ -4,10 +4,11 @@ from datasets import concatenate_datasets
 import torchaudio
 import torchaudio.functional as F
 import os
-from datasets import load_dataset
+from datasets import load_dataset, Audio
 from utils import batch_pad_right
 import random
 import torch
+import soundfile as sf
 from typing import Optional, Tuple, List, Sequence
 
 random.seed(0)
@@ -44,7 +45,7 @@ class SpeechDataModule(pl.LightningDataModule):
         if stage in ("predict", "test"):
             if self.args.is_speechocean:
                 print("setting up speechocean dataset for evaluation...")
-                self.test_set = SpeechOceanDataset(dataset_path=self.args.data_dir, split=self.args.split, sr=self.conf.data.sr)
+                self.test_set = SpeechOceanDataset(sr=self.conf.data.sr)
             else:
                 self.test_set = SpeechDataset(self.args.predict_id_file, self.args.data_dir,
                                           default_sr=self.conf.data.sr, ext=self.conf.data.ext)
@@ -173,33 +174,33 @@ class SpeechDataset(Dataset):
 
 
 class SpeechOceanDataset(Dataset):
-    def __init__(self, dataset_path: str = "andybi7676/speechocean_with_mfa",
-                 split: str = "train", sr: int = 24000):
+    def __init__(self, dataset_path: str = "peggy2009/speechocean_with_mfa",
+                 split: str = "train", sr: int = 24000):       
         self.dataset = load_dataset(dataset_path, split=split)
+        self.dataset = self.dataset.cast_column("audio", Audio(decode=False))
+        self.dataset = self.dataset.select(range(2))
+
         self.split = split
         self.sr = sr
-        self.uid_column = next(
-            (name for name in ("uid", "id", "utt_id", "audio_id") if name in self.dataset.column_names),
-            None,
-        )
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, index: int) -> Tuple[str, torch.Tensor]:
         row = self.dataset[index]
-        audio = row["audio"]
-        wav = torch.as_tensor(audio["array"], dtype=torch.float32)
-        if wav.dim() == 2:
-            wav = wav[0]
+        #print(f"Row: {row}")
 
-        audio_sr = audio["sampling_rate"]
+        audio = torch.Tensor(row["path"]["array"])
+        audio_sr = row['path']['sampling_rate']
+        #print(f"Row audio: {audio}")
+       
+        
         if audio_sr != self.sr:
-            wav = F.resample(wav, audio_sr, self.sr)
+            wav = F.resample(audio, audio_sr, self.sr)
 
-        path = audio._hf_encoded.get('path').split('.')[0]
+        #path = audio._hf_encoded.get('path').split('.')[0]
 
-        uid = str(row[self.uid_column]) if self.uid_column is not None else f"{self.split}_{index}_{path}"
+        uid = f"{row['filename']}"
         return uid, wav
 
 

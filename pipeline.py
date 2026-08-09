@@ -103,7 +103,7 @@ class GSLMPipeline(nn.Module):
                     token_emb_dim=self.token_emb_dim,
                 )
             # use self._lm for config access
-            self.pad_index = decoder_model.config.pad_token_id
+            self.pad_index = decoder_model.config.bos_token_id
             self.bos_index = decoder_model.config.bos_token_id
             self.eos_index = decoder_model.config.eos_token_id
 

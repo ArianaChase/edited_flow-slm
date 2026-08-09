@@ -14,8 +14,8 @@ model:
   token_conditioning: True
   future_conditioning: True
   norm: "static"
-  mean_path: "statistics/mimi_mean.npy"
-  std_path: "statistics/mimi_std.npy"
+  mean_path: "/home/u5504709/new_work/speech_ppl/flow-slm/statistics/mimi_mean.npy"
+  std_path: "/home/u5504709/new_work/speech_ppl/flow-slm/statistics/mimi_std.npy"
   extra_future_tokens: 4 
 
 optimizer:

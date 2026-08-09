@@ -9,6 +9,12 @@ import shutil
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 import math
+import json
+from datasets import load_dataset 
+from difflib import SequenceMatcher
+import numpy as np
+import pandas as pd
+from wordfreq import word_frequency
 
 def batch_pad_right(tensors: list, mode="constant", value=0):
     """
@@ -210,31 +216,208 @@ class SaveAtSpecificStep(pl.Callback):
             checkpoint_path = f"{self.ckpt_dir}/checkpoint_at_step_{trainer.global_step}.ckpt"
             trainer.save_checkpoint(checkpoint_path)
 
+def is_overlapping(a_start, a_end, b_start, b_end):
+    if (a_end >= b_start and a_start <= b_end):
+        return True
+    else:
+        return False
             
-def writing_output_to_file(output, output_dir, token=False):
-    if token:
-        f_token_loss = open(os.path.join(output_dir, f"token_loss.txt"), "w")
+def writing_output_to_file(output, output_dir, granularity, pooling, dataset="peggy2009/speechocean_with_mfa", token=False):
+    '''
+    output : a list of dicts, each containing the uid, the list of flow losses, the list of token losses
+    '''
 
-    with open(os.path.join(output_dir, f"loss.txt"), "w") as f_loss:
-        for batch in output:
-            if token:
-                for id, loss, token_loss in zip(*batch):
-                    if type(loss) == torch.Tensor and loss.ndim > 0:
-                        loss = loss.cpu().numpy()
-                        # turn into string
-                        loss = " ".join([str(l) for l in loss])
-                    if type(token_loss) == torch.Tensor and token_loss.ndim > 0:
-                        token_loss = token_loss.cpu().numpy()
-                        token_loss = " ".join([str(l) for l in token_loss])
-                    f_loss.write(f"{id} {loss}\n")
-                    f_token_loss.write(f"{id} {token_loss}\n")
+    ppl_info = []
+    error_log = []
+    nan_count = 0
+    FRAMERATE = 1 / 12.5
+    REDUCTION_FACTOR = 1
+    data = list(load_dataset(dataset, split="train"))
+
+    for utterance_info in output:
+        print(f"NEW UTTERANCE")
+        if token: # word/phone level
+            id = utterance_info['ids'][0]
+            flow_losses = utterance_info['flow_loss']
+            token_losses = utterance_info['token_loss']
+
+            utt_data = next((item for item in data if item['filename'] == id), None)
+            if utt_data is None:
+                error_log.append(f"File {id} is not in the hf dataset")
+                continue
+
+            # External preparation
+            auc_threshold = None
+            alignments = None
+            human_annotation_obj = json.loads(utt_data['human_annotations'])
+            human_scores = None
+            phone_scores = []
+            word_scores = []
+            for word_obj in human_annotation_obj["words"]:
+                for i in range(0, len(word_obj["phones"])):
+                    phone_scores.append({
+                        "phone" : word_obj["phones"][i], 
+                        "accuracy" : word_obj["phones-accuracy"][i]
+                    }) 
+                word_scores.append({
+                    "word" : word_obj["text"],
+                    "accuracy" : word_obj["accuracy"],
+                    "stress" : word_obj["stress"] # unused for now
+                })
+
+            # Preprocessing
+            if granularity == "phone":
+                # align canonical phonemes and phone alignments
+                phone_alignments = json.loads(utt_data['phone_alignments'])
+                phone_alignments_labels = [item['label'] for item in phone_alignments]
+                phone_scores_labels = [item['phone'] for item in phone_scores]
+    
+                matcher = SequenceMatcher(None, phone_scores_labels, phone_alignments_labels)
+                opcodes = matcher.get_opcodes()
+                has_error = False
+                matched_alignments = []
+                matched_scores = []
+                for tag, a_idx1, a_idx2, b_idx1, b_idx2 in opcodes:
+                    if tag == "equal":
+                        matched_scores.extend(phone_scores[a_idx1:a_idx2])
+                        matched_alignments.extend(phone_alignments[b_idx1:b_idx2])
+                phone_alignments = matched_alignments
+                phone_scores = matched_scores
+    
+                if len(phone_alignments) != len(phone_scores):
+                    error_log.append(f"Alignment mismatch at file {id}. {len(phone_alignments)} alignments but {len(phone_scores)} scores.")
+                    error_log.append(f"{[item['label'] for item in phone_alignments]}\n{[item['phone'] for item in phone_scores]}")
+    
+                human_scores = phone_scores
+                alignments = phone_alignments
+                auc_threshold = 0.5
+
+            elif granularity == "word":
+                word_alignments = json.loads(utt_data['word_alignments'])
+                if len(word_scores) != len(word_alignments):
+                    raise Exception("Human word annotations cannot be aligned with word alignments.")
+                human_scores = word_scores
+                alignments = word_alignments
+                auc_threshold = 3
+
+            # create a python list of flow losses and a list of token losses, both belonging to 1 utterance
+            flow_losses_timestamps = []
+            if type(flow_losses) == torch.Tensor and flow_losses.ndim > 0:
+                flow_losses = flow_losses.squeeze().mean(dim=-1).cpu().numpy()  # list of losses
+                for idx, loss in enumerate(flow_losses):
+                    #print(f"Flow loss: {loss}")
+                    start_time = idx * REDUCTION_FACTOR * FRAMERATE
+                    end_time = (idx + 1) * REDUCTION_FACTOR * FRAMERATE
+                    flow_losses_timestamps.append((loss, start_time, end_time))
             else:
-                for id, loss in zip(*batch):
-                    if type(loss) == torch.Tensor:
-                        loss = loss.cpu().numpy()
-                        loss = " ".join([str(l) for l in loss])
-                    f_loss.write(f"{id} {loss}\n")
-    return
+                flow_losses = None
+                error_log.append(f"At file {id}, no flow_losses")
+
+            token_losses_timestamps = []
+            if type(token_losses) == torch.Tensor and token_losses.ndim > 0:
+                token_losses = token_losses.squeeze().cpu().numpy()
+                for idx, loss in enumerate(token_losses):
+                    #print(f"Token loss: {loss}")
+
+                    start_time = idx * REDUCTION_FACTOR * FRAMERATE
+                    end_time = (idx + 1) * REDUCTION_FACTOR * FRAMERATE
+                    token_losses_timestamps.append((loss, start_time, end_time))
+            else:
+                token_losses = None
+                error_log.append(f"At file {id}, no token_losses")
+
+            # aggregate
+            if len(flow_losses_timestamps) <= 0 and len(token_losses_timestamps) <= 0:
+                error_log.append(f"file {id} doesn't have valid losses")
+                continue
+
+            for loss_type in ['flow', 'token']:
+                if loss_type == "flow":
+                    losses_with_timestamps = flow_losses_timestamps
+                else:
+                    losses_with_timestamps = token_losses_timestamps
+
+                for i in range(0, len(alignments)):
+                    current_alignment = alignments[i]
+
+                    a_start = current_alignment["start"]
+                    a_end = current_alignment["end"]
+                    losses = []
+
+                    for loss_item in losses_with_timestamps:
+                        print(loss_item)
+                        t_start = loss_item[1]
+                        t_end = loss_item[2]
+                        if is_overlapping(a_start, a_end, t_start, t_end):
+                            losses.append(loss_item[0])
+                    
+                    # pooling
+                    loss_pooled = np.nan
+                    
+                    if pooling == "mean":
+                        loss_pooled = np.mean(losses) if len(losses) > 0 else np.nan
+                    elif pooling == "max":
+                        loss_pooled = np.max(losses) if len(losses) > 0 else np.nan
+                    elif pooling == "std":
+                        loss_pooled = np.std(losses) if len(losses) > 1 else np.nan
+                    else:
+                        raise Exception("No pooling method specified.")
+                    
+                    if np.isnan(loss_pooled):
+                        nan_count += 1
+
+                    # # normalization
+                    # if granularity == "phone":
+                    #     # z-score normalization
+                    #     phone_label = strip_stress(alignments[i]['label']) # type: ignore
+                    #     p_mean = norm_dict[phone_label]['mean'] # type: ignore
+                    #     p_std = norm_dict[phone_label]['std'] # type: ignore
+                    #     loss_pooled_norm = ((loss_pooled - p_mean) / p_std) if p_std > 0 else np.nan
+                    # else :
+                    #     word = alignments[i]['label']
+                    #     freq = word_frequency(word, 'en')
+                    #     neg_log_freq = -math.log(freq) if freq > 0 else np.nan  # guard against unknown words
+                    #     w_mean = None
+                    #     w_std = None
+
+                    #     for bucket, item in norm_dict.items():
+                    #         s = item['freq_range']
+                    #         clean_s = s.strip("()[]")
+                    #         left_str, right_str = clean_s.split(",")
+                    #         left = float(left_str)
+                    #         right = float(right_str)
+                    #         interval = pd.Interval(left, right, closed="right")
+
+                    #         if neg_log_freq in interval:
+                    #             w_mean = item['mean']
+                    #             w_std = item['std']
+
+                    #     if w_mean != None and w_std != None and w_std > 0:
+                    #         loss_pooled_norm = (loss_pooled - w_mean) / w_std
+                    #     else:
+                    #         loss_pooled_norm = np.nan
+
+                    ppl_info.append({
+                        "filename" : id,
+                        "label" : current_alignment['label'],
+                        'auc_label' : 1 if human_scores[i]['accuracy'] > auc_threshold else 0,
+                        'loss_type' : loss_type,
+                        "ppl_loss" : loss_pooled,
+                        #"ppl_loss_norm" : loss_pooled_norm,
+                        "human_score": human_scores[i]['accuracy']
+                    })
+
+        else: # utterance
+            pass
+
+    with open("/home/u5504709/new_work/speech_ppl/src/flow/error_log", "a") as f:
+        for i in error_log:
+            f.write(i)
+            f.write("\n")
+    return {
+            "results" : ppl_info,
+            "nan_count" : nan_count
+        } 
 
 def import_module_from_path(module_name, module_path):
     try:

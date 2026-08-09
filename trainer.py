@@ -6,6 +6,7 @@ Refactored to split responsibilities into smaller helper methods, fix a couple
 of mode/device issues, and improve readability.
 """
 
+import json
 import torch
 import torch.nn.functional as F
 import lightning.pytorch as pl
@@ -24,6 +25,16 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from utils import replace_values, writing_output_to_file, SaveAtSpecificStep, select_latest_ckpt
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from dataset import SpeechDataModule
+import gspread
+from google.oauth2.service_account import Credentials
+from sklearn.metrics import roc_auc_score
+import pandas as pd
+import scipy.stats 
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 
 class LanguageModeling(pl.LightningModule):
     """Main training class for continuous GSLM.
@@ -274,9 +285,16 @@ class LanguageModeling(pl.LightningModule):
             total_loss, flow_loss_val, token_loss, token_acc = self.forward(batch, reduction=self.args.reduction)
 
         if token_loss is not None:
-            return ids, -flow_loss_val, -token_loss
+            return {
+                'ids': ids, 
+                'flow_loss': flow_loss_val, 
+                'token_loss': token_loss
+            }
         else:
-            return ids, -flow_loss_val
+            return {
+                'ids': ids,
+                'flow_loss' : flow_loss_val
+            }
 
     def test_step(self, batch, batch_idx):
         total_loss, flow_loss_val, token_loss, token_acc = self.forward(batch, reduction="token")
@@ -285,6 +303,29 @@ class LanguageModeling(pl.LightningModule):
             self.log("test/token_loss", token_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
             self.log("test/token_acc", token_acc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return total_loss, token_loss, token_acc
+
+def append_to_sheet(
+    row_data,
+    spreadsheet_name="ICASSP 2026 Experiment Results",
+    worksheet_name="main",
+    service_account_file="/home/u5504709/new_work/speech_ppl/src/service_account.json"
+):
+    # Authenticate
+    creds = Credentials.from_service_account_file(
+        service_account_file,
+        scopes=SCOPES
+    )
+
+    client = gspread.authorize(creds)
+
+    # Open sheet
+    spreadsheet = client.open(spreadsheet_name)
+    worksheet = spreadsheet.worksheet(worksheet_name)
+
+    # Append row
+    worksheet.append_row(row_data)
+
+    print("Spreadsheet updated successfully.")
 
 def main():
     parser = argparse.ArgumentParser(description="")
@@ -315,6 +356,9 @@ def main():
     parser.add_argument("--override", help="override the hyperparameters in conf", default=None, type=str)
 
     args = parser.parse_args()
+
+    if args.is_speechocean:
+        print(f"Running speechocean version...")
 
     # load config
     with open(args.conf) as f:
@@ -433,7 +477,56 @@ def main():
     elif args.predict_only:
         data.setup(stage="predict")
         output = trainer.predict(language_modeling, data)
-        writing_output_to_file(output, args.prediction_output_dir, token=conf.optimizer.token_loss_weight > 0)
+
+        MODEL_TYPE="Flow-SLM"
+        NORM_DICT_DIR = "/home/u5504709/new_work/speech_ppl/src/gslm/tools/result_dicts"
+
+        for granularity in ["phone", "word"]:
+            for pool in ["mean", "max", "std"]:
+    
+                # if granularity == "phone" or granularity == "word":
+                #     with open(f"{NORM_DICT_DIR}/{MODEL_TYPE}_{granularity}_{pool}_norm.json", "r") as f:
+                #         norm_dict = json.load(f)
+                # else:
+                #     norm_dict = None
+    
+                results = writing_output_to_file(
+                    output, 
+                    args.prediction_output_dir, 
+                    granularity="phone", 
+                    pooling="mean", 
+                    token=conf.optimizer.token_loss_weight > 0
+                    )
+
+                ppl_results = results["results"]
+                nan_percent = (results["nan_count"] / len(ppl_results)) * 100
+
+                # correlate
+                df = pd.DataFrame(ppl_results)
+
+                for loss_type in ['Flow-SLM_acoustic', 'Flow-SLM_semantic']:
+                    if loss_type == "Flow-SLM_acoustic":
+                        df_f = df[df["loss_type"] == 'flow']
+                        print(f"flow df : {len(df_f)}")
+                        df_f.dropna(axis=0, subset=df_f.columns.drop('ppl_loss'), inplace=True)
+                        x_f = df_f["ppl_loss"]
+                        y = df_f['human_score']
+                        pcc = scipy.stats.pearsonr(x_f, y)
+                    else:
+                        df_t = df[df["loss_type"] == 'token']
+                        print(f"token df : {len(df_t)}")
+                        df_t.dropna(axis=0, subset=df_t.columns.drop('ppl_loss'), inplace=True)
+                        x_t = df_t["ppl_loss"]
+                        y = df_t['human_score']
+                        pcc = scipy.stats.pearsonr(x_t, y)
+
+                    pcc_norm_stats = "n/a"
+                    pcc_norm_pvalue = "n/a"
+                    auc = "n/a"
+                    auc_norm = "n/a"
+  
+                    # Record in CSV 
+                    append_to_sheet([MODEL_TYPE, loss_type, granularity, pool, pcc.statistic, pcc.pvalue, pcc_norm_stats, pcc_norm_pvalue, auc, auc_norm, f"{nan_percent:2f}" + "%", len(df)])
 
 
 if __name__ == "__main__":
