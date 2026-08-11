@@ -15,6 +15,7 @@ from difflib import SequenceMatcher
 import numpy as np
 import pandas as pd
 from wordfreq import word_frequency
+from tqdm import tqdm
 
 def batch_pad_right(tensors: list, mode="constant", value=0):
     """
@@ -221,8 +222,64 @@ def is_overlapping(a_start, a_end, b_start, b_end):
         return True
     else:
         return False
+
+
+def strip_stress(phone_label):
+    if phone_label[-1].isdigit():
+        return phone_label[:-1]
+    else:
+        return phone_label
+
+def extract_timestamps(output):
+    error_log = []
+    losses = []
+
+    for utterance_info in output:
+        REDUCTION_FACTOR = 1
+        FRAMERATE = 1 / 12.5
+        id = utterance_info['ids'][0]
+        flow_losses = utterance_info['flow_loss']
+        token_losses = utterance_info['token_loss']
+
+        flow_losses_timestamps = []
+        if type(flow_losses) == torch.Tensor and flow_losses.ndim > 0:
+            flow_losses = flow_losses.squeeze().mean(dim=-1).cpu().numpy()  # list of losses
+            for idx, loss in enumerate(flow_losses):
+                #print(f"Flow loss: {loss}")
+                start_time = idx * REDUCTION_FACTOR * FRAMERATE
+                end_time = (idx + 1) * REDUCTION_FACTOR * FRAMERATE
+                flow_losses_timestamps.append((loss, start_time, end_time))
+        else:
+            flow_losses = None
+            error_log.append(f"At file {id}, no flow_losses")
+
+        token_losses_timestamps = []
+        if type(token_losses) == torch.Tensor and token_losses.ndim > 0:
+            token_losses = token_losses.squeeze().cpu().numpy()
+            for idx, loss in enumerate(token_losses):
+                #print(f"Token loss: {loss}")
+                start_time = idx * REDUCTION_FACTOR * FRAMERATE
+                end_time = (idx + 1) * REDUCTION_FACTOR * FRAMERATE
+                token_losses_timestamps.append((loss, start_time, end_time))
+        else:
+            token_losses = None
+            error_log.append(f"At file {id}, no token_losses")
+
+        losses.append({
+            'id' : id,
+            'flow_losses_timestamps' : flow_losses_timestamps,
+            'token_losses_timestamps' : token_losses_timestamps
+        })
+
+    with open("/home/u5504709/new_work/speech_ppl/src/gslm/tools/error_log", "a") as f:
+            for i in error_log:
+                f.write(i)
+                f.write("\n")
+
+    return losses
+
             
-def writing_output_to_file(output, output_dir, granularity, pooling, dataset="peggy2009/speechocean_with_mfa", token=False):
+def process_speechocean_outputs(output, granularity, pooling, norm_dicts, dataset="peggy2009/speechocean_with_mfa", token=False):
     '''
     output : a list of dicts, each containing the uid, the list of flow losses, the list of token losses
     '''
@@ -230,18 +287,19 @@ def writing_output_to_file(output, output_dir, granularity, pooling, dataset="pe
     ppl_info = []
     error_log = []
     nan_count = 0
-    FRAMERATE = 1 / 12.5
-    REDUCTION_FACTOR = 1
     data = list(load_dataset(dataset, split="train"))
 
-    for utterance_info in output:
-        print(f"NEW UTTERANCE")
-        if token: # word/phone level
-            id = utterance_info['ids'][0]
-            flow_losses = utterance_info['flow_loss']
-            token_losses = utterance_info['token_loss']
+    data_by_id = {item['filename']: item for item in data}
+    pbar = tqdm(output, desc=f"{granularity}-{pooling}")
 
-            utt_data = next((item for item in data if item['filename'] == id), None)
+    for utterance_info in pbar:
+        #print(f"NEW UTTERANCE")
+        if token: # word/phone level
+            id = utterance_info['id']
+            flow_losses_timestamps = utterance_info['flow_losses_timestamps']
+            token_losses_timestamps = utterance_info['token_losses_timestamps']
+            utt_data = data_by_id.get(id)
+
             if utt_data is None:
                 error_log.append(f"File {id} is not in the hf dataset")
                 continue
@@ -300,32 +358,6 @@ def writing_output_to_file(output, output_dir, granularity, pooling, dataset="pe
                 alignments = word_alignments
                 auc_threshold = 3
 
-            # create a python list of flow losses and a list of token losses, both belonging to 1 utterance
-            flow_losses_timestamps = []
-            if type(flow_losses) == torch.Tensor and flow_losses.ndim > 0:
-                flow_losses = flow_losses.squeeze().mean(dim=-1).cpu().numpy()  # list of losses
-                for idx, loss in enumerate(flow_losses):
-                    #print(f"Flow loss: {loss}")
-                    start_time = idx * REDUCTION_FACTOR * FRAMERATE
-                    end_time = (idx + 1) * REDUCTION_FACTOR * FRAMERATE
-                    flow_losses_timestamps.append((loss, start_time, end_time))
-            else:
-                flow_losses = None
-                error_log.append(f"At file {id}, no flow_losses")
-
-            token_losses_timestamps = []
-            if type(token_losses) == torch.Tensor and token_losses.ndim > 0:
-                token_losses = token_losses.squeeze().cpu().numpy()
-                for idx, loss in enumerate(token_losses):
-                    #print(f"Token loss: {loss}")
-
-                    start_time = idx * REDUCTION_FACTOR * FRAMERATE
-                    end_time = (idx + 1) * REDUCTION_FACTOR * FRAMERATE
-                    token_losses_timestamps.append((loss, start_time, end_time))
-            else:
-                token_losses = None
-                error_log.append(f"At file {id}, no token_losses")
-
             # aggregate
             if len(flow_losses_timestamps) <= 0 and len(token_losses_timestamps) <= 0:
                 error_log.append(f"file {id} doesn't have valid losses")
@@ -334,81 +366,113 @@ def writing_output_to_file(output, output_dir, granularity, pooling, dataset="pe
             for loss_type in ['flow', 'token']:
                 if loss_type == "flow":
                     losses_with_timestamps = flow_losses_timestamps
+                    norm_dict = norm_dicts[0]
                 else:
                     losses_with_timestamps = token_losses_timestamps
+                    norm_dict = norm_dicts[1]
 
-                for i in range(0, len(alignments)):
-                    current_alignment = alignments[i]
+                if granularity != "utterance":
+                    for i in range(0, len(alignments)):
+                        current_alignment = alignments[i]
 
-                    a_start = current_alignment["start"]
-                    a_end = current_alignment["end"]
+                        a_start = current_alignment["start"]
+                        a_end = current_alignment["end"]
+                        losses = []
+
+                        for loss_item in losses_with_timestamps:
+                            #print(loss_item)
+                            t_start = loss_item[1]
+                            t_end = loss_item[2]
+                            if is_overlapping(a_start, a_end, t_start, t_end):
+                                losses.append(loss_item[0])
+                        
+                        # pooling
+                        loss_pooled = np.nan
+                        
+                        if pooling == "mean":
+                            loss_pooled = np.mean(losses).item() if len(losses) > 0 else np.nan
+                        elif pooling == "max":
+                            loss_pooled = np.max(losses).item() if len(losses) > 0 else np.nan
+                        elif pooling == "std":
+                            loss_pooled = np.std(losses).item() if len(losses) > 1 else np.nan
+                        else:
+                            raise Exception("No pooling method specified.")
+                        
+                        if np.isnan(loss_pooled):
+                            nan_count += 1
+
+                        # normalization
+                        if granularity == "phone":
+                            # z-score normalization
+                            phone_label = strip_stress(alignments[i]['label']) # type: ignore
+                            p_mean = norm_dict[phone_label]['mean'] # type: ignore
+                            p_std = norm_dict[phone_label]['std'] # type: ignore
+                            loss_pooled_norm = ((loss_pooled - p_mean) / p_std) if p_std > 0 else np.nan
+                        else :
+                            word = alignments[i]['label']
+                            freq = word_frequency(word, 'en')
+                            neg_log_freq = -math.log(freq) if freq > 0 else np.nan  # guard against unknown words
+                            w_mean = None
+                            w_std = None
+
+                            for bucket, item in norm_dict.items():
+                                s = item['freq_range']
+                                clean_s = s.strip("()[]")
+                                left_str, right_str = clean_s.split(",")
+                                left = float(left_str)
+                                right = float(right_str)
+                                interval = pd.Interval(left, right, closed="right")
+
+                                if neg_log_freq in interval:
+                                    w_mean = item['mean']
+                                    w_std = item['std']
+
+                            if w_mean != None and w_std != None and w_std > 0:
+                                loss_pooled_norm = (loss_pooled - w_mean) / w_std
+                            else:
+                                loss_pooled_norm = np.nan
+
+                        ppl_info.append({
+                            "filename" : id,
+                            "label" : current_alignment['label'],
+                            'auc_label' : 1 if human_scores[i]['accuracy'] > auc_threshold else 0,
+                            'loss_type' : loss_type,
+                            "ppl_loss" : loss_pooled,
+                            "ppl_loss_norm" : loss_pooled_norm,
+                            "human_score": human_scores[i]['accuracy']
+                        })
+                else:
+                    auc_threshold = 3
+                    human_scores = human_annotation_obj['accuracy']
+
                     losses = []
-
                     for loss_item in losses_with_timestamps:
-                        print(loss_item)
-                        t_start = loss_item[1]
-                        t_end = loss_item[2]
-                        if is_overlapping(a_start, a_end, t_start, t_end):
-                            losses.append(loss_item[0])
+                        losses.append(loss_item[0])
                     
                     # pooling
                     loss_pooled = np.nan
                     
                     if pooling == "mean":
-                        loss_pooled = np.mean(losses) if len(losses) > 0 else np.nan
+                        loss_pooled = np.mean(losses).item() if len(losses) > 0 else np.nan
                     elif pooling == "max":
-                        loss_pooled = np.max(losses) if len(losses) > 0 else np.nan
+                        loss_pooled = np.max(losses).item() if len(losses) > 0 else np.nan
                     elif pooling == "std":
-                        loss_pooled = np.std(losses) if len(losses) > 1 else np.nan
+                        loss_pooled = np.std(losses).item() if len(losses) > 1 else np.nan
                     else:
                         raise Exception("No pooling method specified.")
                     
                     if np.isnan(loss_pooled):
                         nan_count += 1
-
-                    # # normalization
-                    # if granularity == "phone":
-                    #     # z-score normalization
-                    #     phone_label = strip_stress(alignments[i]['label']) # type: ignore
-                    #     p_mean = norm_dict[phone_label]['mean'] # type: ignore
-                    #     p_std = norm_dict[phone_label]['std'] # type: ignore
-                    #     loss_pooled_norm = ((loss_pooled - p_mean) / p_std) if p_std > 0 else np.nan
-                    # else :
-                    #     word = alignments[i]['label']
-                    #     freq = word_frequency(word, 'en')
-                    #     neg_log_freq = -math.log(freq) if freq > 0 else np.nan  # guard against unknown words
-                    #     w_mean = None
-                    #     w_std = None
-
-                    #     for bucket, item in norm_dict.items():
-                    #         s = item['freq_range']
-                    #         clean_s = s.strip("()[]")
-                    #         left_str, right_str = clean_s.split(",")
-                    #         left = float(left_str)
-                    #         right = float(right_str)
-                    #         interval = pd.Interval(left, right, closed="right")
-
-                    #         if neg_log_freq in interval:
-                    #             w_mean = item['mean']
-                    #             w_std = item['std']
-
-                    #     if w_mean != None and w_std != None and w_std > 0:
-                    #         loss_pooled_norm = (loss_pooled - w_mean) / w_std
-                    #     else:
-                    #         loss_pooled_norm = np.nan
-
+        
                     ppl_info.append({
                         "filename" : id,
-                        "label" : current_alignment['label'],
-                        'auc_label' : 1 if human_scores[i]['accuracy'] > auc_threshold else 0,
+                        "label" : human_annotation_obj["text"],
+                        'auc_label' : 1 if human_scores > auc_threshold else 0,
                         'loss_type' : loss_type,
                         "ppl_loss" : loss_pooled,
-                        #"ppl_loss_norm" : loss_pooled_norm,
-                        "human_score": human_scores[i]['accuracy']
+                        "ppl_loss_norm" : np.nan,
+                        "human_score": human_scores
                     })
-
-        else: # utterance
-            pass
 
     with open("/home/u5504709/new_work/speech_ppl/src/flow/error_log", "a") as f:
         for i in error_log:
@@ -418,6 +482,145 @@ def writing_output_to_file(output, output_dir, granularity, pooling, dataset="pe
             "results" : ppl_info,
             "nan_count" : nan_count
         } 
+
+def process_alignments_ds(input_dataset):
+    
+    alignments = []
+
+    for sample in input_dataset:
+        phone_list = []
+        word_list = []
+
+        for phone_alignment in sample['phonemes']:
+            phone_list.append({
+                "start" : phone_alignment['start'],
+                "end" : phone_alignment["end"],
+                "label" : phone_alignment["phoneme"]
+            })
+
+        for word_alignment in sample["words"]:
+            word_list.append({
+                "start" : word_alignment['start'],
+                "end" : word_alignment["end"],
+                "label" : word_alignment['word']
+            })
+
+        alignments.append({
+            "audio_id" : sample['id'],
+            "phone_alignment" : phone_list,
+            "word_alignment" : word_list
+        })
+    
+    return alignments
+
+def process_librispeech_outputs(output, granularity, pooling, loss_type, data, alignments_ext, token=False):
+
+    '''
+    dataset         : dataset object with speaker, filename, and path
+    alignments      : alignments
+    pooling         : pooling method (max/mean/std)
+    '''
+    result_dict = {}
+    error_log = []
+    nan_count = 0
+    data_by_id = {item['id']: item for item in data}
+    alignments_by_id = {item['audio_id']: item for item in alignments_ext}
+
+    pbar = tqdm(output, desc=f"{granularity}-{pooling}-{loss_type}")
+
+    for utterance_info in pbar:
+        # info
+        if token: # word/phone level
+            id = utterance_info['id']
+            flow_losses_timestamps = utterance_info['flow_losses_timestamps']
+            token_losses_timestamps = utterance_info['token_losses_timestamps']
+
+            utt_data = data_by_id.get(id)
+            if utt_data is None:
+                error_log.append(f"File {id} is not in the hf dataset")
+                continue
+
+            # external preparation
+            alignment_obj = alignments_by_id.get(id)
+            phone_alignments = alignment_obj["phone_alignment"] # type: ignore # list of phone objects {start, end, label}
+            word_alignments = alignment_obj["word_alignment"] # type: ignore # list of phone objects {start, end, label}
+
+            if granularity == "phone":
+                alignments = phone_alignments
+            elif granularity == "word":
+                alignments = word_alignments
+            else:
+                raise Exception("Invalid granularity.")
+
+            # aggregate
+            if len(flow_losses_timestamps) <= 0 and len(token_losses_timestamps) <= 0:
+                error_log.append(f"file {id} doesn't have valid losses")
+                continue
+
+            if loss_type == "flow":
+                losses_with_timestamps = flow_losses_timestamps
+            else:
+                losses_with_timestamps = token_losses_timestamps
+
+            for i in range(0, len(alignments)):
+                current_alignment = alignments[i]
+
+                a_start = current_alignment["start"]
+                a_end = current_alignment["end"]
+                losses = []
+
+                for loss_item in losses_with_timestamps:
+                    #print(loss_item)
+                    t_start = loss_item[1]
+                    t_end = loss_item[2]
+                    if is_overlapping(a_start, a_end, t_start, t_end):
+                        losses.append(loss_item[0])
+            
+                # pooling
+                loss_pooled = np.nan
+                
+                if pooling == "mean":
+                    loss_pooled = np.mean(losses).item() if len(losses) > 0 else np.nan
+                elif pooling == "max":
+                    loss_pooled = np.max(losses).item() if len(losses) > 0 else np.nan
+                elif pooling == "std":
+                    loss_pooled = np.std(losses).item() if len(losses) > 1 else np.nan
+                else:
+                    raise Exception("No pooling method specified.")
+
+                if granularity == "phone":
+                    phone_label = strip_stress(alignments[i]['label'])
+
+                    if phone_label in result_dict:
+                        result_dict[phone_label]['count'] += 1
+                        result_dict[phone_label]['losses'].append(loss_pooled)
+                    else:
+                        result_dict[phone_label] = {
+                            "count" : 1,
+                            "losses" : [loss_pooled]
+                        }
+                elif granularity == "word":
+                    # TODO: Implement wordfreq normalization here
+                    word = alignments[i]['label']
+                    freq = word_frequency(word, 'en')
+                    neg_log_freq = -math.log(freq) if freq > 0 else np.nan  # guard against unknown words
+
+                    if word in result_dict:
+                        result_dict[word]['freq'] = neg_log_freq
+                        result_dict[word]['losses'].append(loss_pooled)
+                    else:
+                        result_dict[word] = {
+                            'freq' : neg_log_freq,
+                            'losses' : [loss_pooled]
+                        }
+
+    with open("/home/u5504709/new_work/speech_ppl/src/gslm/tools/error_log", "a") as f:
+        for i in error_log:
+            f.write(i)
+            f.write("\n")
+
+    return result_dict
+
 
 def import_module_from_path(module_name, module_path):
     try:

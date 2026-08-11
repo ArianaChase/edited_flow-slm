@@ -46,6 +46,9 @@ class SpeechDataModule(pl.LightningDataModule):
             if self.args.is_speechocean:
                 print("setting up speechocean dataset for evaluation...")
                 self.test_set = SpeechOceanDataset(sr=self.conf.data.sr)
+            elif self.args.is_librispeech:
+                print("setting up librispeech dataset for evaluation...")
+                self.test_set = LibriSpeechDataset(sr=self.conf.data.sr)
             else:
                 self.test_set = SpeechDataset(self.args.predict_id_file, self.args.data_dir,
                                           default_sr=self.conf.data.sr, ext=self.conf.data.ext)
@@ -178,7 +181,7 @@ class SpeechOceanDataset(Dataset):
                  split: str = "train", sr: int = 24000):       
         self.dataset = load_dataset(dataset_path, split=split)
         self.dataset = self.dataset.cast_column("audio", Audio(decode=False))
-        self.dataset = self.dataset.select(range(2))
+        self.dataset = self.dataset.select(range(20))
 
         self.split = split
         self.sr = sr
@@ -194,7 +197,6 @@ class SpeechOceanDataset(Dataset):
         audio_sr = row['path']['sampling_rate']
         #print(f"Row audio: {audio}")
        
-        
         if audio_sr != self.sr:
             wav = F.resample(audio, audio_sr, self.sr)
 
@@ -203,6 +205,34 @@ class SpeechOceanDataset(Dataset):
         uid = f"{row['filename']}"
         return uid, wav
 
+class LibriSpeechDataset(Dataset):
+    def __init__(self, dataset_path: str = "openslr/librispeech_asr", split: str = "validation", sr: int = 24000):
+        self.dataset = load_dataset(dataset_path, "clean", split=split, streaming=True)
+
+        temp_data = []
+        for sample in self.dataset:
+            temp_data.append(sample)
+
+        self.dataset = temp_data
+        self.sr = sr
+        self.split = split
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        row = self.dataset[idx]
+        audio = torch.Tensor(row['audio']['array'])
+        audio_sr = row['audio']['sampling_rate']
+
+        if audio_sr != self.sr:
+            wav = F.resample(audio, audio_sr, self.sr)
+        else:
+            wav = audio
+
+        uid = f"{row['id']}"
+
+        return uid, wav
 
 class Collator:
     def __init__(self):

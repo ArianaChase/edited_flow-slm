@@ -8,6 +8,7 @@ of mode/device issues, and improve readability.
 
 import json
 import torch
+from datasets import load_dataset
 import torch.nn.functional as F
 import lightning.pytorch as pl
 from utils import get_cosine_schedule_with_warmup
@@ -18,11 +19,12 @@ import os
 import signal
 import yaml
 import munch
+import numpy as np
 import sys
 from pathlib import Path
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger
-from utils import replace_values, writing_output_to_file, SaveAtSpecificStep, select_latest_ckpt
+from utils import replace_values, process_speechocean_outputs, extract_timestamps, process_alignments_ds, process_librispeech_outputs, SaveAtSpecificStep, select_latest_ckpt
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from dataset import SpeechDataModule
 import gspread
@@ -30,6 +32,7 @@ from google.oauth2.service_account import Credentials
 from sklearn.metrics import roc_auc_score
 import pandas as pd
 import scipy.stats 
+pd.options.mode.chained_assignment = None  # default='warn'
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -240,6 +243,7 @@ class LanguageModeling(pl.LightningModule):
 
         elif reduction == "utterance":
             flow_loss_val = (torch.sum(flow_loss * padding_mask, dim=1) / torch.sum(padding_mask, dim=1)).mean(dim=1)
+
             if token_loss is not None:
                 # by default, ignore eos token during evaluation
                 if self.args.ignore_eos and not self.training:
@@ -337,6 +341,7 @@ def main():
     parser.add_argument("--validation_only", action="store_true")
     parser.add_argument("--predict_only", action="store_true")
     parser.add_argument("--is_speechocean", action="store_true", help="whether the dataset is speechocean, which requires special handling in data loading")
+    parser.add_argument("--is_librispeech", action="store_true")
     parser.add_argument("--split", type=str, default="test", help="which split to evaluate on if --is_speechocean is set")
     parser.add_argument("--training_data", choices=["MLSEn10k", "MLSEn", "MLSEn+people"], default=None)
     parser.add_argument("--valid_id_file", help="Path to validation dataset ids")
@@ -472,62 +477,215 @@ def main():
         except KeyboardInterrupt:
             sys.exit()
     elif args.validation_only:
+
         data.setup(stage="test")
         trainer.test(language_modeling, data)
     elif args.predict_only:
         data.setup(stage="predict")
         output = trainer.predict(language_modeling, data)
 
-        MODEL_TYPE="Flow-SLM"
-        NORM_DICT_DIR = "/home/u5504709/new_work/speech_ppl/src/gslm/tools/result_dicts"
+        if args.is_speechocean:
+            MODEL_TYPE="Flow-SLM"
+            NORM_DICT_DIR = "/home/u5504709/new_work/speech_ppl/src/gslm/tools/result_dicts"
+            
+            output = extract_timestamps(output)
+            for granularity in ["utterance"]:
+                for pool in ["mean", "max", "std"]:
+        
+                    if granularity == "phone" or granularity == "word":
+                        with open(f"{NORM_DICT_DIR}/{MODEL_TYPE}_{granularity}_{pool}_flow_norm.json", "r") as f:
+                            norm_dict_flow = json.load(f)
+                        with open(f"{NORM_DICT_DIR}/{MODEL_TYPE}_{granularity}_{pool}_token_norm.json", "r") as f:
+                            norm_dict_token = json.load(f)
 
-        for granularity in ["phone", "word"]:
-            for pool in ["mean", "max", "std"]:
-    
-                # if granularity == "phone" or granularity == "word":
-                #     with open(f"{NORM_DICT_DIR}/{MODEL_TYPE}_{granularity}_{pool}_norm.json", "r") as f:
-                #         norm_dict = json.load(f)
-                # else:
-                #     norm_dict = None
-    
-                results = writing_output_to_file(
-                    output, 
-                    args.prediction_output_dir, 
-                    granularity="phone", 
-                    pooling="mean", 
-                    token=conf.optimizer.token_loss_weight > 0
-                    )
-
-                ppl_results = results["results"]
-                nan_percent = (results["nan_count"] / len(ppl_results)) * 100
-
-                # correlate
-                df = pd.DataFrame(ppl_results)
-
-                for loss_type in ['Flow-SLM_acoustic', 'Flow-SLM_semantic']:
-                    if loss_type == "Flow-SLM_acoustic":
-                        df_f = df[df["loss_type"] == 'flow']
-                        print(f"flow df : {len(df_f)}")
-                        df_f.dropna(axis=0, subset=df_f.columns.drop('ppl_loss'), inplace=True)
-                        x_f = df_f["ppl_loss"]
-                        y = df_f['human_score']
-                        pcc = scipy.stats.pearsonr(x_f, y)
                     else:
-                        df_t = df[df["loss_type"] == 'token']
-                        print(f"token df : {len(df_t)}")
-                        df_t.dropna(axis=0, subset=df_t.columns.drop('ppl_loss'), inplace=True)
-                        x_t = df_t["ppl_loss"]
-                        y = df_t['human_score']
-                        pcc = scipy.stats.pearsonr(x_t, y)
+                        norm_dict_flow = None
+                        norm_dict_token = None
+        
+                    results = process_speechocean_outputs(
+                        output, 
+                        granularity=granularity, 
+                        pooling=pool, 
+                        norm_dicts=[norm_dict_flow, norm_dict_token],
+                        token=conf.optimizer.token_loss_weight > 0
+                        )
 
-                    pcc_norm_stats = "n/a"
-                    pcc_norm_pvalue = "n/a"
-                    auc = "n/a"
-                    auc_norm = "n/a"
-  
-                    # Record in CSV 
-                    append_to_sheet([MODEL_TYPE, loss_type, granularity, pool, pcc.statistic, pcc.pvalue, pcc_norm_stats, pcc_norm_pvalue, auc, auc_norm, f"{nan_percent:2f}" + "%", len(df)])
+                    ppl_results = results["results"]
+                    nan_percent = (results["nan_count"] / len(ppl_results)) * 100
 
+                    print(ppl_results)
+
+                    # correlate
+                    df = pd.DataFrame(ppl_results)
+
+                    for loss_type in ['Flow-SLM_acoustic', 'Flow-SLM_semantic']:
+                        if loss_type == "Flow-SLM_acoustic":
+                            # default correlation
+                            df_f = df[df["loss_type"] == 'flow']
+                            df_f.dropna(axis=0, subset=df_f.columns.drop('ppl_loss_norm'), inplace=True)
+                            x_f = df_f["ppl_loss"]
+                            y = df_f['human_score']
+                            pcc = scipy.stats.pearsonr(x_f, y)
+
+                            # auc
+                            y_score = df_f["ppl_loss"]
+                            y_true = df_f["auc_label"]
+                            if len(np.unique(y_true)) != 1:
+                                auc = roc_auc_score(y_true, y_score)
+                            else:
+                                auc = "n/a"
+
+                            if granularity != "utterance":
+                                # normalized correlation
+                                df_f_norm = df[df["loss_type"] == 'flow'] # dataframe filtered with only flow metrics
+                                df_f_norm.dropna(axis=0, inplace=True) # drop row if na is involved (na only exists for norm)
+                                x_norm = df_f_norm["ppl_loss_norm"]
+                                y_norm = df_f_norm["human_score"]
+                                if len(x_norm) > 2:
+                                    pcc_norm = scipy.stats.pearsonr(x_norm, y_norm) 
+                                    pcc_norm_stats = pcc_norm.statistic
+                                    pcc_norm_pvalue = pcc_norm.pvalue
+                                else:
+                                    pcc_norm_stats = 'n/a'
+                                    pcc_norm_pvalue = 'n/a'
+
+                                # normalized auc
+                                y_score_norm = df_f_norm["ppl_loss_norm"]
+                                y_true_norm = df_f_norm["auc_label"]
+                                if len(np.unique(y_true_norm)) != 1:
+                                    auc_norm = roc_auc_score(y_true_norm, y_score_norm)
+                                else:
+                                    auc_norm = "n/a"
+                            else:
+                                pcc_norm_stats = 'n/a'
+                                pcc_norm_pvalue = 'n/a'
+                                auc_norm = "n/a"
+
+                        else:
+                            df_t = df[df["loss_type"] == 'token']
+                            df_t.dropna(axis=0, subset=df_t.columns.drop('ppl_loss_norm'), inplace=True)
+                            x_t = df_t["ppl_loss"]
+                            y = df_t['human_score']
+                            pcc = scipy.stats.pearsonr(x_t, y)
+
+                            # auc
+                            y_score = df_t["ppl_loss"]
+                            y_true = df_t["auc_label"]
+                            if len(np.unique(y_true)) != 1:
+                                auc = roc_auc_score(y_true, y_score)
+                            else:
+                                auc = "n/a"
+
+                            if granularity != "utterance":
+                                # normalized correlation
+                                df_t_norm = df[df["loss_type"] == 'flow'] # dataframe filtered with only flow metrics
+                                df_t_norm.dropna(axis=0, inplace=True) # drop row if na is involved (na only exists for norm)
+                                x_norm = df_t_norm["ppl_loss_norm"]
+                                y_norm = df_t_norm["human_score"]
+                                if len(x_norm) > 2:
+                                    pcc_norm = scipy.stats.pearsonr(x_norm, y_norm)
+                                    pcc_norm_stats = pcc_norm.statistic
+                                    pcc_norm_pvalue = pcc_norm.pvalue
+                                else:
+                                    pcc_norm_stats = 'n/a'
+                                    pcc_norm_pvalue = 'n/a'
+
+                                # normalized auc
+                                y_score_norm = df_t_norm["ppl_loss_norm"]
+                                y_true_norm = df_t_norm["auc_label"]
+                                if len(np.unique(y_true_norm)) != 1:
+                                    auc_norm = roc_auc_score(y_true_norm, y_score_norm)
+                                else:
+                                    auc_norm = "n/a"
+                            else:
+                                pcc_norm_stats = 'n/a'
+                                pcc_norm_pvalue = 'n/a'
+                                auc_norm = "n/a"
+        
+                        # Record in CSV 
+                        append_to_sheet([MODEL_TYPE, loss_type, granularity, pool, pcc.statistic, pcc.pvalue, pcc_norm_stats, pcc_norm_pvalue, auc, auc_norm, f"{nan_percent:2f}" + "%", len(df)])
+
+        if args.is_librispeech:
+            MODEL_TYPE = "Flow-SLM"
+            result_dicts_path = "/home/u5504709/new_work/speech_ppl/src/gslm/tools/result_dicts"
+            data = load_dataset("openslr/librispeech_asr", "clean", split="validation")
+            alignments_ds = load_dataset("gilkeyio/librispeech-alignments", streaming=True)
+            alignments_ext = process_alignments_ds(alignments_ds["dev_clean"])
+
+            for gran in ["phone", "word"]:
+                for pool in ["mean", "max", "std"]:
+                    for loss_type in ["flow", "token"]:
+
+                        print(f"Currently: {gran}-{pool}-{loss_type} norm dict...")
+
+                        result_dict = process_librispeech_outputs(
+                            output=output,
+                            granularity=gran,
+                            pooling=pool,
+                            data=data,
+                            alignments_ext=alignments_ext,
+                            loss_type=loss_type,
+                            token=conf.optimizer.token_loss_weight > 0
+                        )
+
+                        if gran == "phone":
+                            if "spn" in list(result_dict.keys()):
+                                result_dict.pop("spn")
+                
+                            for key, phone_info in result_dict.items():
+                                result_dict[key]['mean'] = np.mean(result_dict[key]['losses'])
+                                result_dict[key]['std'] = np.std(result_dict[key]['losses'])
+                
+                            with open(f"{result_dicts_path}/{MODEL_TYPE}_phone_{pool}_{loss_type}_norm.json", "w") as f:
+                                json.dump(result_dict, f)
+                
+                            with open("/home/u5504709/new_work/speech_ppl/src/gslm/tools/error_log", "a") as f:
+                                f.write(f"In total, there are {len(result_dict)} unique phones in the {pool} dictionary.")
+                                f.write("\n")
+                                f.write(f"{sorted(list(result_dict.keys()))}\n")
+                
+                        elif gran == "word":
+                
+                            # TODO: Implement bucketing here, then create a dictionary with only the buckets
+                
+                            NUM_BUCKETS = 5
+                
+                            #print(f"Words to be sorted: {len(result_dict)}")
+                            all_neg_log_freqs = [item['freq'] for word, item in result_dict.items()]
+                            nan_count = np.isnan(all_neg_log_freqs).sum()
+                            x_series = pd.Series(all_neg_log_freqs)
+                            nan_count = x_series.isna().sum()
+                            all_neg_log_freqs = x_series.dropna().to_numpy() 
+                            
+                            bucket_boundaries = pd.qcut(all_neg_log_freqs, q=NUM_BUCKETS)
+                
+                            # print(f"all neg log freqs: {all_neg_log_freqs}, nan count {nan_count}")
+                            # print(f"Boundaries: {bucket_boundaries}, type {type(bucket_boundaries)}")
+                
+                            bucketed_word_dict = {}
+                
+                            for idx, bucket in enumerate(np.unique(bucket_boundaries)):
+                                # print(f"Bucket {idx}: {bucket}")
+                                # print(f"Type: {type(bucket)}")
+                
+                                bucket_losses = []
+                                bucket_word_count = 0
+                
+                                for word, info in result_dict.items():
+                                    if info['freq'] in bucket:
+                                        bucket_losses.append(np.nanmean(info['losses']))
+                                        bucket_word_count += 1
+                
+                                bucketed_word_dict[idx] = {
+                                    'freq_range' : str(bucket),
+                                    'losses' : bucket_losses,
+                                    'mean' : np.mean(bucket_losses),
+                                    'std' : np.std(bucket_losses),
+                                    'count' : bucket_word_count
+                                }
+                            
+                            with open(f"{result_dicts_path}/{MODEL_TYPE}_word_{pool}_{loss_type}_norm.json", "w") as f:
+                                json.dump(bucketed_word_dict, f)
 
 if __name__ == "__main__":
     print("cuda_available()", torch.cuda.is_available())
