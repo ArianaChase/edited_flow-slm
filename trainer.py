@@ -310,9 +310,9 @@ class LanguageModeling(pl.LightningModule):
 
 def append_to_sheet(
     row_data,
+    service_account_file,
     spreadsheet_name="ICASSP 2026 Experiment Results",
     worksheet_name="main",
-    service_account_file="/home/u5504709/new_work/speech_ppl/src/service_account.json"
 ):
     # Authenticate
     creds = Credentials.from_service_account_file(
@@ -358,6 +358,7 @@ def main():
         default="ddp_find_unused_parameters_true",
         choices=["ddp", "ddp_find_unused_parameters_true", "deepspeed_stage_2", "deepspeed_stage_3", "fsdp", "deepspeed_stage_1"],
     )
+    parser.add_argument("--root_dir", type=str)
     parser.add_argument("--override", help="override the hyperparameters in conf", default=None, type=str)
 
     args = parser.parse_args()
@@ -486,9 +487,10 @@ def main():
 
         if args.is_speechocean:
             MODEL_TYPE="Flow-SLM"
-            NORM_DICT_DIR = "/home/u5504709/new_work/speech_ppl/src/gslm/tools/result_dicts"
+            NORM_DICT_DIR = f"{args.root_dir}/src/gslm/tools/result_dicts"
+            SERVICE_ACCOUNT = f"{args.root_dir}/src/service_account.json"
             
-            output = extract_timestamps(output)
+            output = extract_timestamps(args, output)
             for granularity in ["utterance"]:
                 for pool in ["mean", "max", "std"]:
         
@@ -503,6 +505,7 @@ def main():
                         norm_dict_token = None
         
                     results = process_speechocean_outputs(
+                        args,
                         output, 
                         granularity=granularity, 
                         pooling=pool, 
@@ -603,11 +606,11 @@ def main():
                                 auc_norm = "n/a"
         
                         # Record in CSV 
-                        append_to_sheet([MODEL_TYPE, loss_type, granularity, pool, pcc.statistic, pcc.pvalue, pcc_norm_stats, pcc_norm_pvalue, auc, auc_norm, f"{nan_percent:2f}" + "%", len(df)])
+                        append_to_sheet([MODEL_TYPE, loss_type, granularity, pool, pcc.statistic, pcc.pvalue, pcc_norm_stats, pcc_norm_pvalue, auc, auc_norm, f"{nan_percent:2f}" + "%", len(df)], SERVICE_ACCOUNT)
 
         if args.is_librispeech:
             MODEL_TYPE = "Flow-SLM"
-            result_dicts_path = "/home/u5504709/new_work/speech_ppl/src/gslm/tools/result_dicts"
+            result_dicts_path = f"{args.root_dir}/src/gslm/tools/result_dicts"
             data = load_dataset("openslr/librispeech_asr", "clean", split="validation")
             alignments_ds = load_dataset("gilkeyio/librispeech-alignments", streaming=True)
             alignments_ext = process_alignments_ds(alignments_ds["dev_clean"])
@@ -619,6 +622,7 @@ def main():
                         print(f"Currently: {gran}-{pool}-{loss_type} norm dict...")
 
                         result_dict = process_librispeech_outputs(
+                            args,
                             output=output,
                             granularity=gran,
                             pooling=pool,
@@ -639,7 +643,7 @@ def main():
                             with open(f"{result_dicts_path}/{MODEL_TYPE}_phone_{pool}_{loss_type}_norm.json", "w") as f:
                                 json.dump(result_dict, f)
                 
-                            with open("/home/u5504709/new_work/speech_ppl/src/gslm/tools/error_log", "a") as f:
+                            with open(f"{args.root_dir}rc/gslm/tools/error_log", "a") as f:
                                 f.write(f"In total, there are {len(result_dict)} unique phones in the {pool} dictionary.")
                                 f.write("\n")
                                 f.write(f"{sorted(list(result_dict.keys()))}\n")

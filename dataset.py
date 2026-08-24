@@ -10,6 +10,7 @@ import random
 import torch
 import soundfile as sf
 from typing import Optional, Tuple, List, Sequence
+import io
 
 random.seed(0)
 
@@ -180,8 +181,8 @@ class SpeechOceanDataset(Dataset):
     def __init__(self, dataset_path: str = "peggy2009/speechocean_with_mfa",
                  split: str = "train", sr: int = 24000):       
         self.dataset = load_dataset(dataset_path, split=split)
-        self.dataset = self.dataset.cast_column("audio", Audio(decode=False))
-        self.dataset = self.dataset.select(range(20))
+        self.dataset = self.dataset.select(range(10))
+        self.dataset = self.dataset.cast_column("path", Audio(decode=False))
 
         self.split = split
         self.sr = sr
@@ -190,11 +191,13 @@ class SpeechOceanDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, index: int) -> Tuple[str, torch.Tensor]:
+        print(self.dataset.features)
+        print(self.dataset.features["path"])
         row = self.dataset[index]
-        #print(f"Row: {row}")
+        print(row['path'].keys())        #print(f"Row: {row}")
 
-        audio = torch.Tensor(row["path"]["array"])
-        audio_sr = row['path']['sampling_rate']
+        audio, audio_sr = sf.read(io.BytesIO(row['path']['bytes']))
+        audio = torch.from_numpy(audio).float()
         #print(f"Row audio: {audio}")
        
         if audio_sr != self.sr:

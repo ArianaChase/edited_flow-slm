@@ -1,5 +1,5 @@
-torch==2.5.1+cu121
-torchaudio==2.5.1+cu121
+#torch==2.5.1+cu121
+#torchaudio==2.5.1+cu121
 lightning==2.5.6
 numpy==2.2.6
 tqdm==4.67.1

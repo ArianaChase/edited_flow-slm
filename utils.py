@@ -10,7 +10,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 import math
 import json
-from datasets import load_dataset 
+from datasets import load_dataset, Audio
 from difflib import SequenceMatcher
 import numpy as np
 import pandas as pd
@@ -230,7 +230,7 @@ def strip_stress(phone_label):
     else:
         return phone_label
 
-def extract_timestamps(output):
+def extract_timestamps(args, output):
     error_log = []
     losses = []
 
@@ -271,7 +271,7 @@ def extract_timestamps(output):
             'token_losses_timestamps' : token_losses_timestamps
         })
 
-    with open("/home/u5504709/new_work/speech_ppl/src/gslm/tools/error_log", "a") as f:
+    with open(f"{args.root_dir}/src/gslm/tools/error_log", "a") as f:
             for i in error_log:
                 f.write(i)
                 f.write("\n")
@@ -279,7 +279,7 @@ def extract_timestamps(output):
     return losses
 
             
-def process_speechocean_outputs(output, granularity, pooling, norm_dicts, dataset="peggy2009/speechocean_with_mfa", token=False):
+def process_speechocean_outputs(args, output, granularity, pooling, norm_dicts, dataset="peggy2009/speechocean_with_mfa", token=False):
     '''
     output : a list of dicts, each containing the uid, the list of flow losses, the list of token losses
     '''
@@ -287,7 +287,10 @@ def process_speechocean_outputs(output, granularity, pooling, norm_dicts, datase
     ppl_info = []
     error_log = []
     nan_count = 0
-    data = list(load_dataset(dataset, split="train"))
+    data_main = load_dataset(dataset, split="train")
+    data_main = data_main.cast_column("path", Audio(decode=False))
+
+    data = list(data_main)
 
     data_by_id = {item['filename']: item for item in data}
     pbar = tqdm(output, desc=f"{granularity}-{pooling}")
@@ -474,7 +477,7 @@ def process_speechocean_outputs(output, granularity, pooling, norm_dicts, datase
                         "human_score": human_scores
                     })
 
-    with open("/home/u5504709/new_work/speech_ppl/src/flow/error_log", "a") as f:
+    with open(f"{args.root_dir}/src/flow/error_log", "a") as f:
         for i in error_log:
             f.write(i)
             f.write("\n")
@@ -513,7 +516,7 @@ def process_alignments_ds(input_dataset):
     
     return alignments
 
-def process_librispeech_outputs(output, granularity, pooling, loss_type, data, alignments_ext, token=False):
+def process_librispeech_outputs(args, output, granularity, pooling, loss_type, data, alignments_ext, token=False):
 
     '''
     dataset         : dataset object with speaker, filename, and path
@@ -614,7 +617,7 @@ def process_librispeech_outputs(output, granularity, pooling, loss_type, data, a
                             'losses' : [loss_pooled]
                         }
 
-    with open("/home/u5504709/new_work/speech_ppl/src/gslm/tools/error_log", "a") as f:
+    with open(f"{args.root_dir}/src/gslm/tools/error_log", "a") as f:
         for i in error_log:
             f.write(i)
             f.write("\n")
